@@ -46,6 +46,7 @@ RUN node scripts/fetch-plugins.mjs
 # would invalidate the plugin fetch above on every single build.
 COPY .git /.git
 
+ARG NODE_OPTIONS
 RUN pnpm build
 
 # A gzip -9 copy beside each script and stylesheet, which nginx serves as is

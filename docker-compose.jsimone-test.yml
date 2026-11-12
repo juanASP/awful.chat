@@ -1,0 +1,424 @@
+# Test copy of docker-compose.dokploy.yml for awful.jsimone.cloud: a few
+# friends testing noise suppression on a small shared VPS. Differences from
+# upstream, and nothing else:
+#
+#   - No sfu service, and no APP_SFU_URL/APP_SFU_URLS on the frontend. Its
+#     61000-61499 tcp+udp publishing would cost ~9 GiB of docker-proxy on
+#     this host. Voice is P2P and survives without it; camera and screen
+#     share fail with a banner (/sfu answers 502).
+#   - HSTS keeps stsSeconds but drops stsIncludeSubdomains and stsPreload, so
+#     nothing beyond the two test hosts is pinned to https.
+#   - coturn now refuses to render without ANNOUNCED_IP, the check the sfu
+#     used to make for the whole stack.
+#
+# DOMAIN=awful.jsimone.cloud puts the frontend there and the relay on
+# relay.awful.jsimone.cloud (RELAY_DOMAIN default). Set STACK so the traefik
+# names do not collide with any other stack.
+services:
+  relay:
+    build:
+      context: ./relay
+    restart: unless-stopped
+    # Drops every capability and blocks privilege escalation - this process
+    # never needs raw sockets, chown, or setuid. No read_only: not worth the
+    # breakage risk to verify today.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Nothing rotates docker's json-file driver by default, so any log path a
+    # remote party can drive - and the relay has several - fills the host
+    # volume and takes every other service down with it. 30 MB per service.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    expose:
+      - "8080"
+      - "8081"
+    environment:
+      - HTTP_PORT=8080
+      - KLIPY_API_KEY=${KLIPY_API_KEY}
+      - NODE_ENV=production
+      # DOMAIN is the FRONTEND origin (CORS gate). The relay's own hostname
+      # is RELAY_DOMAIN below and defaults to relay.${DOMAIN} - set it when
+      # the relay lives under another name (a dev-relay.example.com), and
+      # keep VITE_API_URL / VITE_RELAY_MULTIADDR pointing at the same name.
+      - DOMAIN=${DOMAIN}
+      # Shared with coturn below, which now REQUIRES it (--use-auth-secret).
+      # The relay mints a short-lived HMAC credential per client; there are no
+      # bundled fallback credentials any more, so unset means no TURN at all
+      # and relayed peers (mobile, CGNAT) cannot connect. See README.
+      - TURN_SECRET=${TURN_SECRET:-}
+      # The hostname the relay puts in the TURN urls it mints. Falls back to
+      # DOMAIN, which is wrong whenever DOMAIN is behind a CDN: a proxied name
+      # forwards neither UDP nor raw TCP, so TURN silently points at something
+      # that cannot serve it and mobile/CGNAT peers just time out.
+      - TURN_HOST=${TURN_HOST:-}
+      # The port coturn below was told to listen on. The relay builds its
+      # default TURN urls from it, and compose does NOT inject a variable into
+      # a container just because the .env defines it - so without this line
+      # TURN_PORT moves coturn while the relay keeps advertising 3478, and
+      # every client is sent to a port this stack is not on. On a host running
+      # two stacks that port belongs to the other one, which answers 401.
+      - TURN_PORT=${TURN_PORT:-}
+      - TURN_URLS=${TURN_URLS:-}
+      # Generic plugin proxy: allowlisted upstream hosts and named secrets
+      # substituted server-side ({{secret:NAME}}). Each secret is bound to a
+      # host and the one query parameter it fills - NAME@host?param=value,
+      # optionally NAME@host/path/prefix?param=value - so it can reach
+      # nothing else.
+      # What keeps API-using plugins "env + redeploy".
+      - PLUGIN_PROXY_HOSTS=${PLUGIN_PROXY_HOSTS:-}
+      - PLUGIN_PROXY_SECRETS=${PLUGIN_PROXY_SECRETS:-}
+      # Optional diagnostic collector. Unset means the /telemetry route
+      # answers 204 and stores nothing, so an upload silently does nothing and
+      # the app hides its Upload button. See docs/spec.md "Telemetry".
+      - TELEMETRY_ENABLED=${TELEMETRY_ENABLED:-}
+      # The operator console's bearer token. Unset means /telemetry/list and
+      # /telemetry/get answer 404, so a console that is not there is never
+      # advertised. A weak token here hands every uploaded bundle to anyone.
+      - TELEMETRY_ADMIN_TOKEN=${TELEMETRY_ADMIN_TOKEN:-}
+      # Where bundles land. Defaults to /app/data/telemetry, inside the
+      # relay_data volume below - point it outside and bundles do not survive
+      # a redeploy.
+      - TELEMETRY_DIR=${TELEMETRY_DIR:-}
+      # Web Push, ON by default: without it a phone whose app is closed is
+      # never told a DM arrived. "0" turns the whole surface off (/push/config
+      # answers enabled:false, the subscribe routes 404). The push itself
+      # carries no content - see deploy/README.md for what it does disclose.
+      - PUSH_ENABLED=${PUSH_ENABLED:-}
+      # mailto: contact in the VAPID header, which is how a push vendor
+      # reaches an operator whose instance misbehaves. Defaults to
+      # admin@${DOMAIN}.
+      - PUSH_CONTACT=${PUSH_CONTACT:-}
+      # Push services the relay sends to. Unset is the services browsers use
+      # (FCM, Mozilla, Apple, WNS); setting it replaces that list. See
+      # .env.example.
+      - PUSH_ALLOWED_HOSTS=${PUSH_ALLOWED_HOSTS:-}
+      # Whose X-Forwarded-For the relay believes, for every per-client limit
+      # it has. The relay itself trusts NOTHING when this is empty: every
+      # container on dokploy-network holds a private address, so the old
+      # "trust every private range" default let any neighbour forge the header
+      # and pick its own rate-limit bucket.
+      #
+      # The default below is the NAME of Dokploy's Traefik container, which
+      # docker's DNS answers on dokploy-network. The relay re-resolves it every
+      # 30s, so it follows Traefik across a recreate instead of going stale
+      # the way a hand-copied /32 does. If your Traefik runs under another
+      # name, or a CDN sits in front of it, set this (see .env.example). If it
+      # names nothing that resolves, the relay says so at boot and every user
+      # shares Traefik's one bucket until it does.
+      - TRUSTED_PROXY_CIDRS=${TRUSTED_PROXY_CIDRS:-dokploy-traefik}
+      # How many libp2p connections (open tabs) the relay holds at once,
+      # default 2048. Past it new connections are refused at accept and
+      # retried; established tabs are never dropped to make room. Lower it on
+      # a small box. See deploy/README.md, "Relay capacity".
+      - RELAY_MAX_CONNS=${RELAY_MAX_CONNS:-}
+      # The Go runtime's soft memory limit: the garbage collector works harder
+      # as the relay nears it instead of letting the heap double. Keep it
+      # above what RELAY_MAX_CONNS needs at full load (about 550 MB at 2048)
+      # and below what the box can give the relay. Go's units only (768MiB,
+      # 1GiB): 1G or 768MB stop the relay at boot.
+      - GOMEMLIMIT=${RELAY_GOMEMLIMIT:-768MiB}
+    volumes:
+      - relay_data:/app/data
+    networks:
+      - dokploy-network
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.${STACK:-awful}-relay-http.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`)
+      - traefik.http.routers.${STACK:-awful}-relay-http.entrypoints=web
+      - traefik.http.routers.${STACK:-awful}-relay-http.middlewares=${STACK:-awful}-relay-redirect
+      - traefik.http.routers.${STACK:-awful}-relay-https.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`)
+      - traefik.http.routers.${STACK:-awful}-relay-https.entrypoints=websecure
+      - traefik.http.routers.${STACK:-awful}-relay-https.middlewares=${STACK:-awful}-relay-sec
+      - traefik.http.routers.${STACK:-awful}-relay-https.tls=true
+      - traefik.http.routers.${STACK:-awful}-relay-https.tls.certresolver=letsencrypt
+      - traefik.http.services.${STACK:-awful}-relay-service.loadbalancer.server.port=8080
+      - traefik.http.routers.${STACK:-awful}-relay-https.service=${STACK:-awful}-relay-service
+      - traefik.http.routers.${STACK:-awful}-relay-http.service=${STACK:-awful}-relay-service
+      - traefik.http.middlewares.${STACK:-awful}-relay-redirect.redirectscheme.scheme=https
+      # The redirectscheme above upgrades one request; HSTS is what makes the
+      # browser remember to. It has to hang off the https routers - a browser
+      # ignores Strict-Transport-Security on a plain-http response - and off
+      # every one of them, because a client that only ever calls /klipy would
+      # otherwise never be told. No includeSubDomains/preload here (see top).
+      - traefik.http.middlewares.${STACK:-awful}-relay-sec.headers.stsSeconds=63072000
+      - traefik.http.middlewares.${STACK:-awful}-relay-sec.headers.contentTypeNosniff=true
+      - traefik.http.middlewares.${STACK:-awful}-relay-sec.headers.referrerPolicy=strict-origin-when-cross-origin
+      - traefik.http.middlewares.${STACK:-awful}-relay-sec.headers.frameDeny=true
+      - traefik.http.routers.${STACK:-awful}-og.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/og`)
+      - traefik.http.routers.${STACK:-awful}-og.entrypoints=websecure
+      - traefik.http.routers.${STACK:-awful}-og.middlewares=${STACK:-awful}-relay-sec
+      - traefik.http.routers.${STACK:-awful}-og.tls=true
+      - traefik.http.routers.${STACK:-awful}-og.tls.certresolver=letsencrypt
+      - traefik.http.routers.${STACK:-awful}-og.service=${STACK:-awful}-relay-api-service
+      - traefik.http.services.${STACK:-awful}-relay-api-service.loadbalancer.server.port=8081
+      - traefik.http.routers.${STACK:-awful}-klipy.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/klipy`)
+      - traefik.http.routers.${STACK:-awful}-klipy.entrypoints=websecure
+      - traefik.http.routers.${STACK:-awful}-klipy.middlewares=${STACK:-awful}-relay-sec
+      - traefik.http.routers.${STACK:-awful}-klipy.tls=true
+      - traefik.http.routers.${STACK:-awful}-klipy.tls.certresolver=letsencrypt
+      - traefik.http.routers.${STACK:-awful}-klipy.service=${STACK:-awful}-relay-api-service
+      - traefik.http.routers.${STACK:-awful}-turn.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/turn-credentials`)
+      - traefik.http.routers.${STACK:-awful}-turn.entrypoints=websecure
+      - traefik.http.routers.${STACK:-awful}-turn.middlewares=${STACK:-awful}-relay-sec
+      - traefik.http.routers.${STACK:-awful}-turn.tls=true
+      - traefik.http.routers.${STACK:-awful}-turn.tls.certresolver=letsencrypt
+      - traefik.http.routers.${STACK:-awful}-turn.service=${STACK:-awful}-relay-api-service
+      - traefik.http.routers.${STACK:-awful}-steam.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/plugin-proxy`)
+      - traefik.http.routers.${STACK:-awful}-steam.entrypoints=websecure
+      - traefik.http.routers.${STACK:-awful}-steam.middlewares=${STACK:-awful}-relay-sec
+      - traefik.http.routers.${STACK:-awful}-steam.tls=true
+      - traefik.http.routers.${STACK:-awful}-steam.tls.certresolver=letsencrypt
+      - traefik.http.routers.${STACK:-awful}-steam.service=${STACK:-awful}-relay-api-service
+      # The streaming plugin proxy needs its own router: the -steam rule
+      # matches /plugin-proxy only, so without this /plugin-stream is a 404
+      # at the edge no matter what the relay serves.
+      - traefik.http.routers.${STACK:-awful}-pluginstream.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/plugin-stream`)
+      - traefik.http.routers.${STACK:-awful}-pluginstream.entrypoints=websecure
+      - traefik.http.routers.${STACK:-awful}-pluginstream.middlewares=${STACK:-awful}-relay-sec
+      - traefik.http.routers.${STACK:-awful}-pluginstream.tls=true
+      - traefik.http.routers.${STACK:-awful}-pluginstream.tls.certresolver=letsencrypt
+      - traefik.http.routers.${STACK:-awful}-pluginstream.service=${STACK:-awful}-relay-api-service
+      - traefik.http.routers.${STACK:-awful}-invite.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/invite`)
+      - traefik.http.routers.${STACK:-awful}-invite.entrypoints=websecure
+      - traefik.http.routers.${STACK:-awful}-invite.middlewares=${STACK:-awful}-relay-sec
+      - traefik.http.routers.${STACK:-awful}-invite.tls=true
+      - traefik.http.routers.${STACK:-awful}-invite.tls.certresolver=letsencrypt
+      - traefik.http.routers.${STACK:-awful}-invite.service=${STACK:-awful}-relay-api-service
+      - traefik.http.routers.${STACK:-awful}-mailbox.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/mailbox`)
+      - traefik.http.routers.${STACK:-awful}-mailbox.entrypoints=websecure
+      - traefik.http.routers.${STACK:-awful}-mailbox.middlewares=${STACK:-awful}-relay-sec
+      - traefik.http.routers.${STACK:-awful}-mailbox.tls=true
+      - traefik.http.routers.${STACK:-awful}-mailbox.tls.certresolver=letsencrypt
+      - traefik.http.routers.${STACK:-awful}-mailbox.service=${STACK:-awful}-relay-api-service
+      - traefik.http.routers.${STACK:-awful}-push.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/push`)
+      - traefik.http.routers.${STACK:-awful}-push.entrypoints=websecure
+      - traefik.http.routers.${STACK:-awful}-push.middlewares=${STACK:-awful}-relay-sec
+      - traefik.http.routers.${STACK:-awful}-push.tls=true
+      - traefik.http.routers.${STACK:-awful}-push.tls.certresolver=letsencrypt
+      - traefik.http.routers.${STACK:-awful}-push.service=${STACK:-awful}-relay-api-service
+      # Port 8081 is routed per PathPrefix, so a route registered in main.go
+      # is unreachable in production without its own six labels here.
+      - traefik.http.routers.${STACK:-awful}-telemetry.rule=Host(`${RELAY_DOMAIN:-relay.${DOMAIN}}`) && PathPrefix(`/telemetry`)
+      - traefik.http.routers.${STACK:-awful}-telemetry.entrypoints=websecure
+      - traefik.http.routers.${STACK:-awful}-telemetry.middlewares=${STACK:-awful}-relay-sec
+      - traefik.http.routers.${STACK:-awful}-telemetry.tls=true
+      - traefik.http.routers.${STACK:-awful}-telemetry.tls.certresolver=letsencrypt
+      - traefik.http.routers.${STACK:-awful}-telemetry.service=${STACK:-awful}-relay-api-service
+
+  # For TLS TURN (turns: - strongly recommended for mobile-carrier users):
+  # put fullchain.pem + privkey.pem for the domain in a directory, set
+  #   TURN_TLS_DIR=/path/to/certs
+  #   TURN_TLS_ARGS=--cert=/certs/fullchain.pem --pkey=/certs/privkey.pem
+  # and uncomment the volumes line below.
+  #
+  # Relay port range: 51 ports. Production was returning "508 Cannot create
+  # socket" on every allocation (measured, five for five) with this same
+  # range, but the range was the ceiling, not the cause - the client was
+  # spending roughly 20 allocations per peer connection because
+  # iceCandidatePoolSize was 10 and four TURN urls were advertised. With the
+  # pool size gone and the dead urls removed that is ~2 per connection, and 51
+  # is comfortable for the current handful of users. Bumped to 100 for
+  # headroom anyway - with network_mode: host nothing is published per port,
+  # so the range size costs nothing at deploy time. It is 1000 now
+  # (TURN_MIN_PORT/TURN_MAX_PORT).
+  #
+  # --user-quota caps the allocations under one credential id and
+  # --total-quota is the pool for everybody. A credential costs nothing to ask
+  # for, so the relay hands one address at most seven live ones, carrying at
+  # most seven ids between them (25 for an IPv6 /48; see turnMaxLivePerClient
+  # in relay/turn.go), and coturn counts the quota per id whatever a
+  # credential's expiry: with these defaults one address holds at most 84 of
+  # 900 allocations, and filling the pool takes about eleven addresses at
+  # once. Keep the pool inside the relay port range, one port per allocation,
+  # and keep it ten times what one address can hold.
+  #
+  # Loopback and link-local are denied because host networking puts coturn on
+  # the host's stack: without them a relay peer reaches services bound to
+  # 127.0.0.1 and the cloud metadata endpoint at 169.254.169.254. That matters
+  # all the more while the credentials are a shared secret that ships in the
+  # client bundle.
+  #
+  # network_mode: host rather than published ports - docker publishes a range
+  # by starting a userland proxy per port, which does not scale to a usable
+  # relay range. coturn speaks raw UDP/TCP and Traefik does not route it, so
+  # it has no reason to be on the overlay network.
+  #
+  # NOTE: 5349 must ALSO be opened in the VPS firewall. tcp/5349 times out
+  # while an unused port like tcp/12345 refuses immediately, so packets are
+  # being dropped upstream of the host - not a missing listener.
+  #
+  # No --verbose. coturn guards every line that carries a client's source
+  # address behind that flag - the per-session "closed, user <..>, remote
+  # <ip:port>" record and the per-permission and per-channel lines - so
+  # running verbose wrote the one end-to-end view of who talked to whom into
+  # the container log, for as long as the host keeps logs. Errors and startup
+  # still print.
+  #
+  # Keep every argument below a real flag: this is a folded block, so a "#"
+  # line here becomes a literal argument rather than a comment.
+  coturn:
+    # Pinned: a floating :latest changes what runs on every pull with no
+    # diff to review. 4.17.2 is the newest 4.x alpine tag as of this pin.
+    image: coturn/coturn:4.17.2-alpine
+    restart: unless-stopped
+    # The 4.17.2-alpine image sets User=nobody:nogroup. Keep that
+    # unprivileged account. The image puts CAP_NET_BIND_SERVICE=+ep on
+    # /usr/bin/turnserver, so that one capability must remain in the bounding
+    # set or exec itself fails with Operation not permitted. Everything else
+    # is dropped. Do not override User to root when adding TLS certificates;
+    # make their files readable by UID/GID 65534 instead.
+    user: "65534:65534"
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    # Nothing rotates docker's json-file driver by default, so any log path a
+    # remote party can drive - and the relay has several - fills the host
+    # volume and takes every other service down with it. 30 MB per service.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # volumes:
+    #   - ${TURN_TLS_DIR}:/certs:ro
+    # The public relay IP must remain reachable as a peer: two clients using
+    # this TURN server exchange candidates at that same IP. Denying it lets
+    # allocations succeed but rejects their CreatePermission requests (403).
+    command: >
+      --log-file=stdout
+      --realm=${TURN_REALM:-${DOMAIN}}
+      --external-ip=${ANNOUNCED_IP:?ANNOUNCED_IP must be set to the server public IP}
+      --listening-ip=0.0.0.0
+      --use-auth-secret
+      --static-auth-secret=${TURN_SECRET:?TURN_SECRET must be set - see .env.example}
+      --fingerprint
+      --no-multicast-peers
+      --no-tcp-relay
+      --listening-port=${TURN_PORT:-3478}
+      --alt-listening-port=${TURN_ALT_PORT:-5349}
+      --denied-peer-ip=100.64.0.0-100.127.255.255
+      --denied-peer-ip=10.0.0.0-10.255.255.255
+      --denied-peer-ip=192.168.0.0-192.168.255.255
+      --denied-peer-ip=172.16.0.0-172.31.255.255
+      --denied-peer-ip=127.0.0.0-127.255.255.255
+      --denied-peer-ip=169.254.0.0-169.254.255.255
+      --denied-peer-ip=0.0.0.0-0.255.255.255
+      --denied-peer-ip=224.0.0.0-255.255.255.255
+      --denied-peer-ip=::1
+      --denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+      --denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+      --min-port=${TURN_MIN_PORT:-49152}
+      --max-port=${TURN_MAX_PORT:-50151}
+      --total-quota=${TURN_TOTAL_QUOTA:-900}
+      --user-quota=${TURN_USER_QUOTA:-12}
+      ${TURN_TLS_ARGS:-}
+    network_mode: host
+
+  frontend:
+    build:
+      # The repo root, not ./frontend: the build reads .git to resolve the
+      # commit and repository it came from. The root .dockerignore keeps the
+      # context from carrying anything else.
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        # External plugins fetched at build time; see frontend/plugins/README.md.
+        # Pin each to a commit's whole 40-character sha (owner/repo@<sha>) - an
+        # instance built from a moving ref cannot be rebuilt by anyone later,
+        # including you.
+        - PLUGIN_SOURCES=${PLUGIN_SOURCES:-}
+        # Unpinned sources - no ref, or an abbreviated sha - fail the build
+        # unless this is 1.
+        - PLUGIN_SOURCES_ALLOW_UNPINNED=${PLUGIN_SOURCES_ALLOW_UNPINNED:-}
+        - NODE_OPTIONS=--max-old-space-size=3072
+    # Instance configuration, read at START and served as /config.json rather
+    # than compiled into the bundle, so two instances of the same commit and
+    # plugin set serve identical bytes however differently they are
+    # configured - which is what a published build hash can be checked
+    # against. Changing a relay here needs a restart, not a rebuild.
+    environment:
+      - APP_API_URL=${VITE_API_URL}
+      - APP_RELAY_MULTIADDR=${VITE_RELAY_MULTIADDR}
+      # No APP_SFU_URL/APP_SFU_URLS: this stack has no SFU (see top).
+      # Optional pages, off unless set: /qs sends a file to one person with
+      # no account, /qc is a call with no room.
+      - APP_USE_QS=${USE_QS:-}
+      - APP_USE_QC=${USE_QC:-}
+      # Settings > What's new, fetched from GitHub by this container at start
+      # (frontend/docker-entrypoint.d/41-awful-whats-new.sh). 0 turns it off.
+      - APP_WHATS_NEW=${WHATS_NEW:-}
+    restart: unless-stopped
+    # Drops every capability except what the stock nginx image needs: the
+    # master starts as root and setuid/setgids its workers to the nginx user
+    # (SETUID, SETGID), and the entrypoint chowns its cache dirs (CHOWN).
+    # Port 80 needs no NET_BIND_SERVICE: docker sets
+    # ip_unprivileged_port_start=0 inside a non-host network namespace. No
+    # read_only: nginx writes to tmp paths at runtime, not worth the breakage
+    # risk to verify today.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    # Nothing rotates docker's json-file driver by default, so any log path a
+    # remote party can drive - and the relay has several - fills the host
+    # volume and takes every other service down with it. 30 MB per service.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    depends_on:
+      - relay
+    networks:
+      # dokploy-network for traefik. internal is kept as upstream has it but
+      # holds nothing else here, so nginx's /sfu proxy finds no "sfu" and
+      # answers 502.
+      - dokploy-network
+      - internal
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.${STACK:-awful}-awful2-http.rule=Host(`${DOMAIN}`)
+      - traefik.http.routers.${STACK:-awful}-awful2-http.entrypoints=web
+      - traefik.http.routers.${STACK:-awful}-awful2-http.middlewares=${STACK:-awful}-awful2-redirect
+      - traefik.http.middlewares.${STACK:-awful}-awful2-redirect.redirectscheme.scheme=https
+      # Same reasoning as relay-sec above: the 301 upgrades one request, this
+      # is what stops the next one starting in plain text. Content-Security-
+      # Policy is not here - it lives in frontend/nginx.conf, next to the app
+      # whose sources it describes.
+      - traefik.http.middlewares.${STACK:-awful}-awful2-sec.headers.stsSeconds=63072000
+      - traefik.http.middlewares.${STACK:-awful}-awful2-sec.headers.contentTypeNosniff=true
+      - traefik.http.middlewares.${STACK:-awful}-awful2-sec.headers.referrerPolicy=strict-origin-when-cross-origin
+      - traefik.http.middlewares.${STACK:-awful}-awful2-sec.headers.frameDeny=true
+      - traefik.http.routers.${STACK:-awful}-awful2-https.rule=Host(`${DOMAIN}`)
+      - traefik.http.routers.${STACK:-awful}-awful2-https.entrypoints=websecure
+      - traefik.http.routers.${STACK:-awful}-awful2-https.middlewares=${STACK:-awful}-awful2-sec
+      - traefik.http.routers.${STACK:-awful}-awful2-https.tls=true
+      - traefik.http.routers.${STACK:-awful}-awful2-https.tls.certresolver=letsencrypt
+      - traefik.http.services.${STACK:-awful}-awful2-service.loadbalancer.server.port=80
+      - traefik.http.routers.${STACK:-awful}-awful2-https.service=${STACK:-awful}-awful2-service
+      - traefik.http.routers.${STACK:-awful}-awful2-http.service=${STACK:-awful}-awful2-service
+
+volumes:
+  relay_data:
+
+networks:
+  dokploy-network:
+    external: true
+  # Created per project, so its real name carries the compose project prefix
+  # and the "sfu" alias inside it belongs to THIS stack alone. That is the
+  # whole fix: two stacks on one host stop sharing a namespace they were never
+  # meant to share.
+  internal:
+    driver: bridge
